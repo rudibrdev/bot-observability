@@ -45,6 +45,18 @@ try {
     removed += count;
     if (count < batchSize) break;
   }
+  let rejectionBucketsRemoved = 0;
+  while (true) {
+    const result = await sql`
+      DELETE FROM bot_rejections WHERE ctid IN (
+        SELECT ctid FROM bot_rejections WHERE day < ${boundary.cutoff}::date
+        ORDER BY day LIMIT ${batchSize}
+      )
+    `;
+    rejectionBucketsRemoved += result.count ?? 0;
+    if ((result.count ?? 0) < batchSize) break;
+  }
+  console.log(`removed ${rejectionBucketsRemoved} rejection fingerprint bucket(s) before ${boundary.cutoff} 00:00 UTC`);
   console.log(`removed ${removed} raw event(s) before ${boundary.cutoff} 00:00 UTC in batches of ${batchSize}; daily history preserved`);
 } finally {
   await sql.end();

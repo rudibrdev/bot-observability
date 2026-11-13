@@ -42,6 +42,10 @@ export function proxy(request: NextRequest, event: NextFetchEvent) {
         method: request.method,
         environment: process.env.VERCEL_ENV ?? process.env.NODE_ENV,
         user_agent: ua,
+        // This example only prefilters: collector classification is the fallback.
+        // If your server already classifies bots, send its complete bot_name +
+        // bot_category pair here. Do not expose the ingestion credential to clients.
+        // The collector then trusts that pair and stores its own UA cross-check.
         ip,
         // 200 means "forwarded": a request-stage proxy runs before the page
         // renders, so a later 404/500 is not visible here. Never send 0 for

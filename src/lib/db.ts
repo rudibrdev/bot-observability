@@ -2,6 +2,8 @@ import postgres from "postgres";
 import { getIngestionConfig } from "./auth";
 import type {
   BotHit,
+  BotRejection,
+  DailyRejectionCount,
   BotHitRow,
   BotCount,
   BotCategory,
@@ -189,12 +191,14 @@ export function createDbClient(databaseUrl: string) {
           event_id, created_at, project_name, environment, host, path, query_string,
           method, status_code, bot_name, bot_category, confidence, user_agent,
           referer, ip, country, region, city, timezone,
-          deployment_url, vercel_id, is_api_route, sample_rate, heartbeat
+          deployment_url, vercel_id, is_api_route, sample_rate, heartbeat,
+          collector_bot_name, collector_bot_category, classification_source, classification_mismatch
         ) VALUES (
           ${hit.event_id ?? null}, ${createdAt}, ${hit.project_name}, ${hit.environment}, ${hit.host}, ${hit.path}, ${hit.query_string},
           ${hit.method}, ${hit.status_code}, ${hit.bot_name}, ${hit.bot_category}, ${hit.confidence}, ${hit.user_agent},
           ${hit.referer}, ${hit.ip}, ${hit.country}, ${hit.region}, ${hit.city}, ${hit.timezone},
-          ${hit.deployment_url}, ${hit.vercel_id}, ${hit.is_api_route}, ${hit.sample_rate}, ${hit.heartbeat}
+          ${hit.deployment_url}, ${hit.vercel_id}, ${hit.is_api_route}, ${hit.sample_rate}, ${hit.heartbeat},
+          ${hit.collector_bot_name ?? null}, ${hit.collector_bot_category ?? null}, ${hit.classification_source ?? null}, ${hit.classification_mismatch ?? null}
         )
         ON CONFLICT (project_name, event_id) WHERE event_id IS NOT NULL DO NOTHING
         RETURNING created_at, project_name, bot_name, bot_category
@@ -219,6 +223,34 @@ export function createDbClient(databaseUrl: string) {
       SELECT EXISTS (SELECT 1 FROM inserted_hit) AS inserted
     `;
     return result[0].inserted;
+  }
+
+  async function recordRejection(input: BotRejection): Promise<void> {
+    await sql`
+      INSERT INTO bot_rejections (day, project_name, reason, ua_fingerprint, bot_name, bot_category)
+      VALUES ((now() AT TIME ZONE 'UTC')::date, ${input.project_name}, ${input.reason}, ${input.ua_fingerprint}, ${input.bot_name}, ${input.bot_category})
+      ON CONFLICT (day, project_name, reason)
+      DO UPDATE SET count = bot_rejections.count + 1,
+        ua_fingerprint = EXCLUDED.ua_fingerprint, bot_name = EXCLUDED.bot_name, bot_category = EXCLUDED.bot_category,
+        last_seen_at = GREATEST(bot_rejections.last_seen_at, EXCLUDED.last_seen_at)
+    `;
+  }
+
+  async function dailyRejections(from: Date, to: Date, project?: string): Promise<DailyRejectionCount[]> {
+    // Whole UTC days intersecting [from, to), including today's partial day.
+    const end = new Date(to);
+    if (end.getUTCHours() || end.getUTCMinutes() || end.getUTCSeconds() || end.getUTCMilliseconds()) {
+      end.setUTCDate(end.getUTCDate() + 1);
+      end.setUTCHours(0, 0, 0, 0);
+    }
+    const rows = await sql`
+      SELECT day::text, reason, SUM(count)::text AS count FROM bot_rejections
+      WHERE day >= (${from}::timestamptz AT TIME ZONE 'UTC')::date
+        AND day < (${end}::timestamptz AT TIME ZONE 'UTC')::date
+        ${project ? sql`AND project_name = ${project}` : sql``}
+      GROUP BY day, reason ORDER BY day DESC, reason
+    `;
+    return rows.map(row => ({ day: row.day, reason: row.reason, count: Number(row.count) }));
   }
 
   async function upsertProjectHeartbeat(input: {
@@ -1501,6 +1533,8 @@ export function createDbClient(databaseUrl: string) {
             SELECT project_name FROM bot_hits_daily WHERE project_name != ''
             UNION
             SELECT project_name FROM project_receipts WHERE project_name != ''
+            UNION
+            SELECT project_name FROM bot_rejections WHERE project_name != ''
           ) projects ORDER BY project_name
         ) t), '[]') as projects_json,
         (SELECT MAX(last_heartbeat_at) FROM project_health WHERE project_name != '' ${projectClause}) as latest_heartbeat,
@@ -1526,6 +1560,8 @@ export function createDbClient(databaseUrl: string) {
 
   return {
     insertHit,
+    recordRejection,
+    dailyRejections,
     queryFiltered,
     requestAnalysis,
     hourlyCounts,

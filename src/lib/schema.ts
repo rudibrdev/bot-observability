@@ -35,6 +35,10 @@ export interface BotHit {
   status_code: number;
   bot_name: string;
   bot_category: BotCategory;
+  collector_bot_name?: string | null;
+  collector_bot_category?: BotCategory | null;
+  classification_source?: "sender" | "collector";
+  classification_mismatch?: boolean;
   confidence: Confidence;
   user_agent: string;
   referer: string;
@@ -305,5 +309,19 @@ export interface NewBot {
 
 export interface HourlyCount {
   hour: number;
+  count: number;
+}
+
+export interface BotRejection {
+  project_name: string;
+  reason: "not_bot" | "non_production" | "project_quota_exceeded" | "invalid_payload" | "invalid_event_id" | "duplicate";
+  ua_fingerprint: string;
+  bot_name: string;
+  bot_category: string;
+}
+
+export interface DailyRejectionCount {
+  day: string;
+  reason: string;
   count: number;
 }

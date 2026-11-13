@@ -54,6 +54,66 @@ it forwards, meaning "forwarded" rather than a verified origin response; it
 must not send `0` for those requests, or every outcome becomes unknown.
 Response-stage logging is needed to capture actual origin outcomes.
 
+## Ingestion audit (migration 009)
+
+Apply migration 009 **before** starting the new collector/dashboard or running
+its retention script (`npm run migrate`, following the stopped/backup upgrade
+sequence above). It adds nullable cross-check columns to `bot_hits` and a compact
+`bot_rejections` counter table; it does not rewrite historical traffic or plans.
+
+For each authenticated refused POST the collector increments the UTC day/project/
+reason counter atomically, with first/last receipt timestamps and the **latest**
+project-keyed HMAC-SHA-256 UA fingerprint and reported bot name/category. These are
+last-observed examples, not a per-UA history. At most six counter rows exist per
+project/day regardless of changing UAs or names. Reasons: `not_bot`,
+`non_production`, `project_quota_exceeded`, `invalid_payload`, `invalid_event_id`,
+and `duplicate`. Only the first refusal reason reached is counted. Credentials
+scope the project (legacy credentials keep their existing submitted-project behavior).
+No raw rejected UA, IP, URL or body is retained. Rotating `BOT_IP_HASH_SECRET`
+changes fingerprints, not counts. Auditing failure returns `500 storage_failed`
+instead of claiming a durable refusal. Storage failures themselves cannot be
+reliably audited to an unavailable database. Invalid credentials/configuration
+are not attributed to a project and cause no database writes.
+
+Refusal counters count attempts, including retries, not unique requests. They
+are not expanded by `sample_rate`. The overview panel groups them per day/reason
+and applies only the project/time selection. Counters begin with this upgrade;
+previous silent refusals cannot be recovered. `npm run retain-raw` prunes them
+at the same UTC-day cutoff as raw hits, in batches; unlike accepted-hit daily
+rollups, refusal history is not preserved after pruning.
+
+The quota still bounds accepted bot/control submissions per project/process,
+not total database operations: exact durable refusal counts require a database
+update for every authenticated refused POST, including 429s. No background
+sampling or memory-only audit can guarantee these counts on serverless shutdown.
+Use ingress request limits and protect/rotate project credentials for abuse
+control; this is not a distributed denial-of-service defence.
+
+For new accepted rows, `classification_source` is `sender` for a complete valid
+reported bot pair, otherwise `collector`. `collector_bot_name` and
+`collector_bot_category` store the collector's independent result (NULL if no
+match). `classification_mismatch` is true when a sender pair differs from that
+result, **including a collector miss**; false for agreement or collector-only
+fallback. Historical rows have NULL comparison fields, meaning not compared.
+Trusting sender identity never grants `verified` confidence: original client IP
+verification is unchanged. Heartbeats/probes create no bot rows.
+
+```sql
+SELECT day, reason, SUM(count) AS refusals
+FROM bot_rejections WHERE project_name = 'your-project'
+GROUP BY day, reason ORDER BY day DESC, reason;
+
+SELECT created_at, bot_name, bot_category, collector_bot_name,
+       collector_bot_category, classification_source, classification_mismatch
+FROM bot_hits WHERE project_name = 'your-project'
+  AND classification_mismatch IS TRUE ORDER BY created_at DESC LIMIT 100;
+```
+
+Use authenticated `probe: "connection"` for local setup proof, as documented
+in the README. It persists `project_receipts`, not traffic; leave the production
+`BOT_INCLUDE_NON_PRODUCTION` setting unchanged. The collector cannot measure
+requests that never execute a website sender (including bypassed static routes).
+
 ## Repair known historical records
 
 Migration 008 adds `history_repairs`, an audit ledger excluded from analytics.

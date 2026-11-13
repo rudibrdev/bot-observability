@@ -117,7 +117,7 @@ describe.skipIf(!url)("UTC retention boundary", () => {
     target.searchParams.set("search_path", schema);
     try {
       await admin.unsafe(`CREATE SCHEMA "${schema}"`);
-      for (const file of ["001_init.sql", "002_rollups.sql", "005_raw_retention.sql"]) await scoped.unsafe(readFileSync(join(migrationsDir, file), "utf8"));
+      for (const file of ["001_init.sql", "002_rollups.sql", "005_raw_retention.sql", "009_ingestion_audit.sql"]) await scoped.unsafe(readFileSync(join(migrationsDir, file), "utf8"));
       const [{ cutoff }] = await scoped`SELECT ((now() AT TIME ZONE 'UTC')::date - 1)::text AS cutoff`;
       await scoped`INSERT INTO bot_hits (created_at, project_name, bot_name, bot_category) VALUES
         (${cutoff}::date - interval '1 millisecond', 'retention', 'OldBot', 'generic'),
@@ -125,8 +125,12 @@ describe.skipIf(!url)("UTC retention boundary", () => {
         (${cutoff}::date + interval '1 millisecond', 'retention', 'BoundaryBot', 'generic')`;
       await scoped`INSERT INTO bot_hits_daily (day, project_name, bot_name, bot_category, status_class, hits) VALUES
         (${cutoff}::date - 1, 'retention', 'OldBot', 'generic', 'unknown', 75)`;
+      await scoped`INSERT INTO bot_rejections (day, project_name, reason, ua_fingerprint, bot_name, bot_category) VALUES
+        (${cutoff}::date - 1, 'retention', 'not_bot', 'old', '', ''),
+        (${cutoff}::date, 'retention', 'not_bot', 'boundary', '', '')`;
       await execFileAsync("node", [join(__dirname, "..", "..", "scripts", "retain-raw-events.mjs"), target.toString(), "1"], { env: { ...process.env, RAW_EVENT_RETENTION_BATCH_SIZE: "1" } });
       expect((await scoped`SELECT COUNT(*)::int AS count FROM bot_hits`)[0].count).toBe(2);
+      expect((await scoped`SELECT ua_fingerprint FROM bot_rejections`).map(row => row.ua_fingerprint)).toEqual(["boundary"]);
       expect((await scoped`SELECT hits FROM bot_hits_daily`)[0].hits).toBe(75);
       expect((await scoped`SELECT pruned_before::text FROM raw_retention_state`)[0].pruned_before).toBe(cutoff);
       const prior = new Date(`${cutoff}T00:00:00Z`); prior.setUTCDate(prior.getUTCDate() - 1);

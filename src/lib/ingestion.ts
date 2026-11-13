@@ -1,9 +1,11 @@
+import { createHmac } from "node:crypto";
+import { CATEGORY_ORDER } from "./categories";
 import { isIP } from "node:net";
 import { sanitizeQuery, sanitizeReferer } from "./url-privacy";
 import { NextResponse } from "next/server";
 import { detectBot } from "@/lib/bots";
 import { getRequestDb } from "@/lib/request-db";
-import type { BotHit } from "@/lib/schema";
+import type { BotHit, BotCategory, BotRejection } from "@/lib/schema";
 import { verifyBot } from "@/lib/verify";
 import {
   authenticateIngestion,
@@ -113,33 +115,55 @@ export async function ingestRequest(request: Request) {
   }
 
   const payload = await readPayload(request);
+  const submittedProject = text(payload?.project_name || payload?.project, "default", 200).trim() || "default";
+  const projectName = identity.projectName ?? submittedProject;
+  const userAgent = text(payload?.user_agent, request.headers.get("user-agent") ?? "");
+  // Only authenticated refusals can be attributed to a project. Never retain
+  // raw refused bodies, IPs, or UAs; retain only the latest keyed UA example.
+  async function reject(reason: BotRejection["reason"], response: Response) {
+    try {
+      await getRequestDb(databaseUrl!).recordRejection({
+        project_name: projectName, reason,
+        ua_fingerprint: createHmac("sha256", ipHashSecret).update(projectName).update("\0").update(userAgent).digest("hex"),
+        bot_name: text(payload?.bot_name, "", 200),
+        bot_category: text(payload?.bot_category, "", 100),
+      });
+      return response;
+    } catch (error) {
+      console.error("[bot-hit] failed to audit rejection", error);
+      return jsonError("storage_failed", 500);
+    }
+  }
   if (!payload) {
-    return jsonError("Invalid or too-large JSON payload", 400);
+    return reject("invalid_payload", jsonError("Invalid or too-large JSON payload", 400));
   }
 
   const heartbeat = bool(payload.heartbeat);
-  const submittedProject = text(payload.project_name || payload.project, "default", 200).trim() || "default";
-  // New credentials are scoped to one project. The submitted project is
-  // accepted only for the legacy migration path.
-  const projectName = identity.projectName ?? submittedProject;
-  const userAgent = text(payload.user_agent, request.headers.get("user-agent") ?? "");
   const probe = payload.probe === "connection";
-  // Reported bot_name/category are compatibility hints only; UA is authoritative.
-  const match = heartbeat || probe ? null : detectBot(userAgent);
+  const collectorMatch = heartbeat || probe ? null : detectBot(userAgent);
+  // A bearer credential authenticates the sender, not the visiting bot. Use
+  // a complete, valid sender classification as authority; older senders fall
+  // back to UA detection. Verification still requires original-client IP proof.
+  const submittedName = text(payload.bot_name, "", 200).trim();
+  const submittedCategory = payload.bot_category;
+  const senderMatch = !heartbeat && !probe && submittedName &&
+    typeof submittedCategory === "string" && submittedCategory !== "unknown" && CATEGORY_ORDER.includes(submittedCategory as BotCategory)
+    ? { name: submittedName, category: submittedCategory as BotCategory } : null;
+  const match = senderMatch || collectorMatch;
 
   if (!match && !heartbeat && !probe) {
-    return NextResponse.json({ stored: false, reason: "not_bot" });
+    return reject("not_bot", NextResponse.json({ stored: false, reason: "not_bot" }));
   }
 
   if (!heartbeat && !probe && process.env.BOT_INCLUDE_NON_PRODUCTION !== "true" && isNonProductionTraffic(payload)) {
-    return NextResponse.json({ stored: false, reason: "non_production" });
+    return reject("non_production", NextResponse.json({ stored: false, reason: "non_production" }));
   }
 
   const quotaKey = `${heartbeat || probe ? "control" : "bot"}:${projectName}`;
   if (!checkRateLimit(quotaKey, heartbeat || probe ? 30 : botQuota())) {
-    return NextResponse.json({ error: "project_quota_exceeded" }, {
+    return reject("project_quota_exceeded", NextResponse.json({ error: "project_quota_exceeded" }, {
       status: 429, headers: { "Retry-After": "60" },
-    });
+    }));
   }
 
   // Only a sender-supplied original client IP is evidence; transport IP is not.
@@ -175,7 +199,7 @@ export async function ingestRequest(request: Request) {
   // scoped to the authenticated project by the database uniqueness constraint.
   const eventId = payload.event_id;
   if (eventId !== undefined && (typeof eventId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(eventId))) {
-    return jsonError("Invalid event_id", 400);
+    return reject("invalid_event_id", jsonError("Invalid event_id", 400));
   }
 
   const botName = heartbeat ? "Heartbeat" : match?.name ?? "Unknown";
@@ -196,6 +220,10 @@ export async function ingestRequest(request: Request) {
     status_code: statusCode(payload),
     bot_name: botName,
     bot_category: botCategory,
+    collector_bot_name: collectorMatch?.name ?? null,
+    collector_bot_category: collectorMatch?.category ?? null,
+    classification_source: senderMatch ? "sender" : "collector",
+    classification_mismatch: Boolean(senderMatch && (senderMatch.name !== collectorMatch?.name || senderMatch.category !== collectorMatch?.category)),
     confidence,
     user_agent: userAgent,
     referer: sanitizeReferer(text(payload.referer, "", MAX_STRING_LENGTH)),
@@ -215,7 +243,7 @@ export async function ingestRequest(request: Request) {
   try {
     const inserted = await client.insertHit(hit);
     if (!inserted) {
-      return NextResponse.json({ stored: false, reason: "duplicate" });
+      return reject("duplicate", NextResponse.json({ stored: false, reason: "duplicate" }));
     }
   } catch (error) {
     console.error("[bot-hit] failed to store hit", error);

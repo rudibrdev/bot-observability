@@ -1,0 +1,109 @@
+{
+  "checks": [
+    {
+      "label": "unauthenticated probe",
+      "status": 401,
+      "body": {
+        "error": "Unauthorized"
+      }
+    },
+    {
+      "label": "browser refusal",
+      "status": 200,
+      "body": {
+        "stored": false,
+        "reason": "not_bot"
+      }
+    },
+    {
+      "label": "browser refusal",
+      "status": 200,
+      "body": {
+        "stored": false,
+        "reason": "not_bot"
+      }
+    },
+    {
+      "label": "nonproduction refusal",
+      "status": 200,
+      "body": {
+        "stored": false,
+        "reason": "non_production"
+      }
+    },
+    {
+      "label": "sender divergence accepted",
+      "status": 201,
+      "body": {
+        "stored": true,
+        "bot_name": "LocalHTTPProofBot",
+        "bot_category": "generic",
+        "confidence": "ua_only"
+      }
+    },
+    {
+      "label": "legacy UA fallback accepted",
+      "status": 201,
+      "body": {
+        "stored": true,
+        "bot_name": "GPTBot",
+        "bot_category": "ai_training",
+        "confidence": "ua_only"
+      }
+    },
+    {
+      "label": "quota refusal",
+      "status": 429,
+      "body": {
+        "error": "project_quota_exceeded"
+      }
+    },
+    {
+      "label": "local connection probe",
+      "status": 200,
+      "body": {
+        "received": true,
+        "probe": "connection",
+        "project": "__local_http_audit__"
+      }
+    }
+  ],
+  "refusal_counts": [
+    {
+      "reason": "non_production",
+      "count": 1
+    },
+    {
+      "reason": "not_bot",
+      "count": 2
+    },
+    {
+      "reason": "project_quota_exceeded",
+      "count": 1
+    }
+  ],
+  "hits": [
+    {
+      "bot_name": "GPTBot",
+      "collector_bot_name": "GPTBot",
+      "classification_source": "collector",
+      "classification_mismatch": false,
+      "confidence": "ua_only"
+    },
+    {
+      "bot_name": "LocalHTTPProofBot",
+      "collector_bot_name": null,
+      "classification_source": "sender",
+      "classification_mismatch": true,
+      "confidence": "ua_only"
+    }
+  ],
+  "weighted_hits": 5,
+  "receipt_rows": 1,
+  "dashboard": {
+    "status": 200,
+    "refusal_panel": true,
+    "browser_count_rendered": 2
+  },
+  "scope": "Disposable local PostgreSQL and local production-mode Next server only; no live production writes or env changes."
+}

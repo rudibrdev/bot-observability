@@ -1,3 +1,4 @@
+import { IngestionAudit } from "@/components/ingestion-audit";
 import { DashboardFilters } from "@/components/dashboard-filters";
 import { QueryForm } from "@/components/query-form";
 import { FilterSelect } from "@/components/filter-select";
@@ -233,6 +234,10 @@ export default async function DashboardPage({
           <EventsViewServer searchParams={sp} range={range} />
         )}
       </Suspense>
+
+      {view === "overview" && <Suspense key={`audit:${viewCacheKey}`} fallback={<p>Loading ingestion refusals…</p>}>
+        <IngestionAudit from={range.start} to={range.end} project={projectFilter || undefined} />
+      </Suspense>}
 
       <details className="mt-6 border-t border-neutral-800 pt-3 group">
         <summary className="text-xs text-neutral-500 cursor-pointer hover:text-neutral-300 select-none">

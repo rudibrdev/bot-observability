@@ -70,7 +70,7 @@ Open **Website connection** in the dashboard and choose the project's configured
 
 The sender prefilters likely bots, uses a 2-second timeout, checks HTTP failures, and logs a short failure without payloads or credentials. Delivery is best effort, without automatic retries. Every event has a generated `event_id`; the collector deduplicates repeated deliveries of that ID within the same project while the raw event is retained. Reuse the same ID if adding retries. `event.waitUntil` ties work to Next.js's request lifecycle; confirm that your host supports it. The proxy reports the status it can see: a redirect it returns itself reports that redirect's status, and a forwarded request (`NextResponse.next()` or a rewrite) reports `200`. That `200` means "forwarded", not a verified origin response; a proxy runs before the page renders, so a later 404/500 is not visible to it. Do not send `0` for forwarded requests: every outcome would be unknown, which leaves successful paths, error rate and outcome coverage empty.
 
-An original client IP is optional. Only configure `BOT_TRUST_CLIENT_IP_HEADER` on the website when your deployment overwrites that header with the original IP. The collector never replaces a missing payload IP with the sender's transport address. Sampling accepts `1`, `0.5`, `0.25`, or `0.1`; set `BOT_SAMPLE_RATE` on the website if needed. The collector reclassifies the user agent, so reported `bot_name` and `bot_category` do not override it.
+An original client IP is optional. Only configure `BOT_TRUST_CLIENT_IP_HEADER` on the website when your deployment overwrites that header with the original IP. The collector never replaces a missing payload IP with the sender's transport address. Sampling accepts `1`, `0.5`, `0.25`, or `0.1`; set `BOT_SAMPLE_RATE` on the website if needed. If the authenticated sender supplies a nonempty `bot_name` (up to 200 characters) and a supported non-`unknown` `bot_category`, those fields are authoritative. The collector retains its UA classification as a cross-check, not a veto. Senders without a complete valid pair (including the maintained prefilter-only example) keep collector UA classification. A project credential authenticates the sender, not the visiting bot.
 
 ## Generic HTTP contract
 
@@ -78,7 +78,8 @@ Send server-side JSON to `POST /api/bot-hit` with `Authorization: Bearer <projec
 
 | Field | Meaning |
 | --- | --- |
-| `user_agent` | Original website request UA; authoritative for classification |
+| `user_agent` | Original website request UA; collector fallback classification and cross-check |
+| `bot_name`, `bot_category` | Optional complete sender classification; supported categories are `ai_training`, `ai_search`, `ai_agent`, `ai_crawler`, `search_crawler`, `seo_crawler`, `social_preview`, `monitoring`, `generic`. An absent/invalid pair falls back to collector detection |
 | `event_id` | Optional sender-generated ID, 1–128 ASCII letters/digits or `._:-`; reuse for delivery retries, generate a new ID for each actual HTTP request |
 | `url` or `host` + `path` | Requested page; query values are stripped by default |
 | `method` | Website request method; defaults to GET |
@@ -96,7 +97,32 @@ A backend that can observe final outcomes should send the real `status_code`; th
 
 Bot events targeting loopback/localhost, or explicitly labeled `development`, `preview`, `test` or `staging`, are acknowledged with `stored: false, reason: "non_production"` by default. This prevents local tests from contaminating production analytics even when an old sender labels localhost as production. Set `BOT_INCLUDE_NON_PRODUCTION=true` to intentionally include them. This checks the submitted website, not the collector's listening address; connection probes remain available for local setup.
 
+### Test the connection without changing production configuration
+
+Use the project ingestion credential to send a receipt-only probe. This works
+with `BOT_INCLUDE_NON_PRODUCTION` unset or false; it never creates `bot_hits`
+or daily traffic, and it does not bypass authentication or the control quota.
+It tests collector delivery/storage, not ordinary event acceptance or route coverage.
+
+```bash
+curl --fail-with-body "$BOT_COLLECTOR_ORIGIN/api/bot-hit" \
+  -H "Authorization: Bearer $BOT_INGEST_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"probe":"connection","environment":"development","url":"http://localhost:3000"}'
+```
+
+Expected response: `received: true`, `probe: "connection"`, and the credential's
+project. Ordinary local/non-production events still return `non_production`.
+
 ## What the dashboard shows
+
+Overview also shows **Ingestion refusals**, one count per reason per UTC day for
+the selected project. Counts are authenticated POST deliveries, not sample-expanded
+visits. Whole days overlapping the selected interval are shown, including today's
+partial day; bot/category/status filters do not apply. Empty results mean no
+retained records, not proof that every website request was measured. Static
+prerendered routes that never execute a sender remain invisible to the collector.
+See [ingestion audit operations](docs/operations.md#ingestion-audit-migration-009).
 
 Overview has request volume, comparison, AI share, error rate with outcome coverage, one main UTC trend, category/bot shares, successfully fetched paths and evidence links. Request counts leave out redirect hops and show them separately: a bot that requests `/`, receives a 301 and then fetches `/en` made one request, plus one redirect. This applies to request volume, trends, shares, bot rankings, movers and page counts, including history, because redirect statuses are stored. Health and Raw Events still show every response, including redirects. Pages defaults to **Successful GETs**, showing only non-API GETs with reported 2xx outcomes; **All requests** (everything except redirect hops), **Redirects**, errors and missing outcomes remain available separately. HEAD probes and redirect-only paths do not establish successful coverage. These are distinct project + path combinations, not canonical content, visits or a complete site inventory. Hour-of-day distributions, company comparisons and movers are under **More analysis**. Bots offers ranking and detail; Raw Events shows retained request records. Redirects can be expected behavior; the dashboard does not diagnose them as broken automatically.
 

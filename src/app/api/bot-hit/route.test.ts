@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  recordRejection: vi.fn(),
   insertHit: vi.fn(),
   recordConnectionReceipt: vi.fn(),
   upsertProjectHeartbeat: vi.fn(),
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/request-db", () => ({
   getRequestDb: vi.fn(() => ({
+    recordRejection: mocks.recordRejection,
     insertHit: mocks.insertHit,
     recordConnectionReceipt: mocks.recordConnectionReceipt,
     upsertProjectHeartbeat: mocks.upsertProjectHeartbeat,
@@ -48,6 +50,7 @@ describe("POST /api/bot-hit", () => {
     };
     vi.useFakeTimers();
     vi.setSystemTime(new Date(Date.UTC(2026, 9, 2, 12) + ++clockTick * 120_000));
+    mocks.recordRejection.mockReset().mockResolvedValue(undefined);
     mocks.insertHit.mockReset().mockResolvedValue(true);
     mocks.recordConnectionReceipt.mockReset();
     mocks.upsertProjectHeartbeat.mockReset();
@@ -100,7 +103,7 @@ describe("POST /api/bot-hit", () => {
     }))).status).toBe(400);
   });
 
-  it("ignores non-bot false positives without a database write", async () => {
+  it("audits non-bot refusals without writing bot hits", async () => {
     const response = await POST(makeRequest({ project: "attacker-project", user_agent: "Mozilla/5.0" }, {
       authorization: `Bearer ${ingestToken}`,
     }));
@@ -108,6 +111,7 @@ describe("POST /api/bot-hit", () => {
     expect(await response.json()).toEqual({ stored: false, reason: "not_bot" });
     expect(mocks.insertHit).not.toHaveBeenCalled();
     expect(mocks.upsertProjectHeartbeat).not.toHaveBeenCalled();
+    expect(mocks.recordRejection).toHaveBeenCalledWith(expect.objectContaining({ project_name: "tracked-site", reason: "not_bot", ua_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) }));
   });
 
   it("derives project identity from the ingestion credential and normalizes fields", async () => {
@@ -148,6 +152,8 @@ describe("POST /api/bot-hit", () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toEqual({ stored: false, reason: "non_production" });
     }
+    expect(mocks.recordRejection).toHaveBeenCalledTimes(9);
+    expect(mocks.recordRejection).toHaveBeenLastCalledWith(expect.objectContaining({ reason: "non_production" }));
     expect(mocks.insertHit).not.toHaveBeenCalled();
     expect(mocks.verifyBot).not.toHaveBeenCalled();
     expect((await POST(makeRequest({ user_agent: "GPTBot/1.0", url: "https://localhost.example/en" }, headers))).status).toBe(201);
@@ -161,14 +167,27 @@ describe("POST /api/bot-hit", () => {
     expect(await response.json()).toMatchObject({ received: true, probe: "connection" });
     expect(mocks.insertHit).not.toHaveBeenCalled();
     expect(mocks.recordConnectionReceipt).toHaveBeenCalledOnce();
+    expect(mocks.recordRejection).not.toHaveBeenCalled();
+    expect(process.env.BOT_INCLUDE_NON_PRODUCTION).toBe("false");
   });
 
-  it("classifies the UA instead of trusting reported identity", async () => {
+  it("trusts authenticated sender classification and retains collector disagreement", async () => {
     const response = await POST(makeRequest({ user_agent: "GPTBot/1.0", bot_name: "Googlebot", bot_category: "search_crawler" }, { authorization: `Bearer ${ingestToken}` }));
     expect(response.status).toBe(201);
-    expect(mocks.insertHit.mock.calls[0][0]).toMatchObject({ bot_name: "GPTBot", bot_category: "ai_training" });
+    expect(mocks.insertHit.mock.calls[0][0]).toMatchObject({ bot_name: "Googlebot", bot_category: "search_crawler", collector_bot_name: "GPTBot", collector_bot_category: "ai_training", classification_source: "sender", classification_mismatch: true });
     const browser = await POST(makeRequest({ user_agent: "Mozilla/5.0", bot_name: "GPTBot", bot_category: "ai_training" }, { authorization: `Bearer ${ingestToken}` }));
-    expect(await browser.json()).toMatchObject({ stored: false, reason: "not_bot" });
+    expect(browser.status).toBe(201);
+    expect(mocks.insertHit.mock.calls[1][0]).toMatchObject({ bot_name: "GPTBot", collector_bot_name: null, classification_mismatch: true });
+  });
+
+  it("retains agreement and uses collector fallback for incomplete or unknown sender classifications", async () => {
+    const headers = { authorization: `Bearer ${ingestToken}` };
+    expect((await POST(makeRequest({ user_agent: "GPTBot/1.0", bot_name: "GPTBot", bot_category: "ai_training" }, headers))).status).toBe(201);
+    expect(mocks.insertHit.mock.calls[0][0]).toMatchObject({ classification_source: "sender", classification_mismatch: false, collector_bot_name: "GPTBot" });
+    for (const pair of [{ bot_name: "Incomplete" }, { bot_name: "Browser", bot_category: "unknown" }]) {
+      expect((await POST(makeRequest({ user_agent: "GPTBot/1.0", ...pair }, headers))).status).toBe(201);
+      expect(mocks.insertHit.mock.lastCall?.[0]).toMatchObject({ bot_name: "GPTBot", classification_source: "collector", classification_mismatch: false });
+    }
   });
 
   it("passes event IDs to storage and acknowledges duplicate deliveries without another count", async () => {
@@ -266,8 +285,24 @@ describe("POST /api/bot-hit", () => {
     for (let i = 0; i < 2; i++) expect((await POST(makeRequest({ user_agent: "GPTBot/1.0" }, headers))).status).toBe(201);
     const limited = await POST(makeRequest({ user_agent: "GPTBot/1.0" }, headers));
     expect(limited.status).toBe(429);
+    expect(mocks.recordRejection).toHaveBeenLastCalledWith(expect.objectContaining({ reason: "project_quota_exceeded", project_name: "tracked-site" }));
     expect(limited.headers.get("Retry-After")).toBe("60");
     expect((await POST(makeRequest({ user_agent: "GPTBot/1.0" }, { ...headers, authorization: `Bearer ${"o".repeat(32)}` }))).status).toBe(201);
+  });
+
+  it("fails closed if rejection auditing fails", async () => {
+    mocks.recordRejection.mockRejectedValueOnce(new Error("audit unavailable"));
+    const res = await POST(makeRequest({ user_agent: "Mozilla/5.0" }, { authorization: `Bearer ${ingestToken}` }));
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "storage_failed" });
+    expect(mocks.insertHit).not.toHaveBeenCalled();
+  });
+
+  it("requires authentication even for a local connection probe", async () => {
+    const res = await POST(makeRequest({ probe: "connection", environment: "development" }));
+    expect(res.status).toBe(401);
+    expect(mocks.recordConnectionReceipt).not.toHaveBeenCalled();
+    expect(mocks.recordRejection).not.toHaveBeenCalled();
   });
 
   it("keeps probes out of analytics and uses the credential's project", async () => {
